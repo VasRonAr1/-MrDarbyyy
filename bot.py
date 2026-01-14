@@ -1,220 +1,190 @@
-
 import logging
 import os
 import json
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters, ChatMemberHandler
 )
-from datetime import timezone
 
 BOT_TOKEN = '7671853978:AAEb-a3bHU2hDQdqqXwqnj79i_SKq5IEMsg'
 
-# Файл для хранения списка зарегистрированных чатов
 DATA_FILE = 'registered_chats.json'
+ALLOWED_USERNAMES = {'SpammBotsss'}
 
-# Список разрешённых @username в Телеграм
-ALLOWED_USERNAMES = {  'MrDarbyyy', 'SpammBotsss' }
-
-# Загрузка зарегистрированных чатов
+# ===== Загрузка чатов =====
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
         registered_chats = set(tuple(chat) for chat in json.load(f))
 else:
     registered_chats = set()
 
-# Словарь для хранения промежуточных данных пользователя (состояния, интервала и т.п.)
 user_data = {}
+scheduled_jobs = {}
 
-# Логирование
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# Словарь для хранения запланированных заданий
-scheduled_jobs = {}
 
-
+# ===== /start =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
         return
 
-    user_id = update.effective_user.id
-    username = update.effective_user.username  # @username без @
-    logging.info(f"Получена команда /start от пользователя ID: {user_id}, username: @{username}")
+    username = update.effective_user.username
 
-    # Проверяем, есть ли @username пользователя в списке разрешённых
     if username not in ALLOWED_USERNAMES:
-        # Сообщение на немецком
         await update.message.reply_text(
             "Hallo, möchtest du auch so einen Bot? "
-            "Schreib mir @SpammBotss, du kannst ihn einen Tag lang kostenlos ausprobieren."
+            "Schreib mir @SpammBotss."
         )
         return
 
-    # Если пользователь в списке разрешённых, показываем кнопки
     keyboard = [
         [
-            InlineKeyboardButton("📂 Chats ansehen", callback_data='view_chats'),
-            InlineKeyboardButton("📤 Nachricht senden", callback_data='send_message'),
+            InlineKeyboardButton("📂 Chats", callback_data='view_chats'),
+            InlineKeyboardButton("📤 Senden", callback_data='send_message'),
         ],
         [
-            InlineKeyboardButton("🛑 Verteilung stoppen", callback_data='stop_broadcast'),
+            InlineKeyboardButton("🛑 Stop", callback_data='stop_broadcast'),
         ]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "📋 Wählen Sie eine Aktion:",
-        reply_markup=reply_markup
+        "Aktion wählen:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != 'private':
-        return
-
-    user_id = update.effective_user.id
-    logging.info(f"Пользователь {user_id} запросил команду /help.")
-
-    await update.message.reply_text(
-        "ℹ️ Dieser Bot ermöglicht das Senden von Nachrichten 📤 in alle Chats, in denen er hinzugefügt wurde. 📂\n\n"
-        "🔧 Verfügbare Befehle:\n"
-        "/start - Starten Sie die Arbeit mit dem Bot 🚀\n"
-        "/help - Zeigen Sie diese Nachricht an ❓\n"
-        "/stop - Stoppen Sie die aktuelle Verteilung 🛑"
-    )
-
-
+# ===== Buttons =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user_id = query.from_user.id
-    logging.info(f"Пользователь {user_id} нажал кнопку: {query.data}")
 
     if query.data == 'view_chats':
         if registered_chats:
-            chat_list = '\n'.join([f"{chat_title} ({chat_id})" for chat_id, chat_title in registered_chats])
-            await query.message.reply_text(f"📂 Der Bot ist in folgenden Chats hinzugefügt:\n{chat_list}")
+            text = '\n'.join([f"{t} ({i})" for i, t in registered_chats])
+            await query.message.reply_text(text)
         else:
-            await query.message.reply_text("🚫 Der Bot ist in keinem Chat hinzugefügt.")
+            await query.message.reply_text("Keine Chats.")
+
     elif query.data == 'send_message':
         user_data[user_id] = {'state': 'awaiting_interval'}
-        await query.message.reply_text("⏰ Bitte geben Sie das Intervall in Minuten für das Senden der Nachricht ein.")
+        await query.message.reply_text(
+            "⏱ Intervall in Sekunden eingeben:"
+        )
+
     elif query.data == 'stop_broadcast':
         if user_id in scheduled_jobs:
-            job = scheduled_jobs[user_id]
-            job.schedule_removal()
+            scheduled_jobs[user_id].cancel()
             del scheduled_jobs[user_id]
-            await query.message.reply_text("🛑 Die Verteilung wurde gestoppt.")
+            await query.message.reply_text("🛑 Gestoppt.")
         else:
-            await query.message.reply_text("❌ Keine aktive Verteilung.")
+            await query.message.reply_text("❌ Läuft nichts.")
 
 
+# ===== Messages =====
 async def receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logging.info(f"Получено сообщение от пользователя {user_id}")
 
-    if user_id in user_data:
-        state = user_data[user_id].get('state')
-        if state == 'awaiting_interval':
-            # Получаем интервал
-            try:
-                interval = int(update.message.text)
-                if interval <= 0:
-                    raise ValueError
-                user_data[user_id]['interval'] = interval
-                user_data[user_id]['state'] = 'awaiting_broadcast_message'
-                await update.message.reply_text(
-                    f"⏰ Das Intervall wurde auf {interval} Minuten eingestellt.\n"
-                    f"✉️ Jetzt senden Sie bitte die Nachricht für die Verteilung."
-                )
-            except ValueError:
-                await update.message.reply_text("⚠️ Bitte geben Sie eine positive ganze Zahl ein.")
-        elif state == 'awaiting_broadcast_message':
-            message_to_forward = update.message
-            interval = user_data[user_id]['interval']
+    if user_id not in user_data:
+        return
 
-            if not registered_chats:
-                await update.message.reply_text("🚫 Der Bot ist in keinem Chat hinzugefügt.")
-                user_data[user_id]['state'] = None
-                return
+    state = user_data[user_id].get('state')
 
-            job_queue = context.job_queue
-            if job_queue is None:
-                logging.error("JobQueue не инициализирована.")
-                await update.message.reply_text("⚠️ Ein Fehler ist aufgetreten: JobQueue ist nicht initialisiert.")
-                return
-
-            # Удаляем предыдущую задачу, если она была
-            if user_id in scheduled_jobs:
-                scheduled_jobs[user_id].schedule_removal()
-
-            job = job_queue.run_repeating(
-                send_scheduled_message,
-                interval=interval * 60,  # секунды
-                first=0,
-                data={'message': message_to_forward, 'chats': registered_chats, 'user_id': user_id}
-            )
-            scheduled_jobs[user_id] = job
-
-            await update.message.reply_text(
-                f"📤 Die Verteilung wurde gestartet. Die Nachricht wird alle {interval} Minuten gesendet."
-            )
-
-            user_data[user_id]['state'] = None
-
-            # Возвращаемся к кнопкам
-            await start(update, context)
-        else:
-            pass
-    else:
-        pass
-
-
-async def send_scheduled_message(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    message_to_forward = job_data['message']
-    chats = job_data['chats']
-    user_id = job_data['user_id']
-
-    from_chat_id = message_to_forward.chat_id
-    message_id = message_to_forward.message_id
-
-    for chat_id, chat_title in chats:
+    if state == 'awaiting_interval':
         try:
-            await context.bot.forward_message(
-                chat_id=chat_id,
-                from_chat_id=from_chat_id,
-                message_id=message_id
+            interval = int(update.message.text)
+            if interval <= 0:
+                raise ValueError
+            user_data[user_id]['interval'] = interval
+            user_data[user_id]['state'] = 'awaiting_message'
+            await update.message.reply_text(
+                f"⏱ {interval} Sekunden.\nJetzt Nachricht senden."
             )
-            logging.info(f"✅ Nachricht an Chat {chat_title} ({chat_id}) gesendet.")
-        except Exception as e:
-            logging.error(f"❌ Nachricht an Chat {chat_title} ({chat_id}) konnte nicht gesendet werden: {e}")
+        except ValueError:
+            await update.message.reply_text("Nur positive Zahl.")
+
+    elif state == 'awaiting_message':
+        if not registered_chats:
+            await update.message.reply_text("Keine Chats.")
+            user_data[user_id] = {}
+            return
+
+        interval = user_data[user_id]['interval']
+        message = update.message
+
+        if user_id in scheduled_jobs:
+            scheduled_jobs[user_id].cancel()
+
+        task = asyncio.create_task(
+            sequential_broadcast(
+                context,
+                message,
+                interval,
+                registered_chats,
+                user_id
+            )
+        )
+
+        scheduled_jobs[user_id] = task
+        user_data[user_id] = {}
+
+        await update.message.reply_text(
+            f"📤 Start. Pause {interval} сек."
+        )
+
+        await start(update, context)
 
 
+# ===== Broadcast =====
+async def sequential_broadcast(context, message, interval, chats, user_id):
+    from_chat_id = message.chat_id
+    message_id = message.message_id
+    chats = list(chats)
+
+    try:
+        while True:
+            for chat_id, chat_title in chats:
+                try:
+                    await context.bot.forward_message(
+                        chat_id=chat_id,
+                        from_chat_id=from_chat_id,
+                        message_id=message_id
+                    )
+                    logging.info(f"Gesendet an {chat_title} ({chat_id})")
+                except Exception as e:
+                    logging.error(
+                        f"Fehler {chat_title} ({chat_id}): {e}"
+                    )
+
+                await asyncio.sleep(interval)
+
+    except asyncio.CancelledError:
+        logging.info(f"Broadcast gestoppt für {user_id}")
+
+
+# ===== Chat add/remove =====
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.my_chat_member
     chat = result.chat
     chat_id = chat.id
-    chat_title = chat.title or chat.full_name or chat.username or str(chat.id)
-    new_status = result.new_chat_member.status
-    old_status = result.old_chat_member.status
+    chat_title = chat.title or chat.username or str(chat.id)
 
-    logging.info(f"my_chat_member-Update: Chat '{chat_title}' ({chat_id}), "
-                 f"alter Status: {old_status}, neuer Status: {new_status}")
+    old = result.old_chat_member.status
+    new = result.new_chat_member.status
 
-    if old_status in ['left', 'kicked'] and new_status in ['member', 'administrator']:
+    if old in ['left', 'kicked'] and new in ['member', 'administrator']:
         registered_chats.add((chat_id, chat_title))
         save_registered_chats()
-        logging.info(f"✅ Bot wurde dem Chat {chat_title} ({chat_id}) hinzugefügt.")
-    elif new_status in ['left', 'kicked']:
+
+    elif new in ['left', 'kicked']:
         registered_chats.discard((chat_id, chat_title))
         save_registered_chats()
-        logging.info(f"❌ Bot wurde aus dem Chat {chat_title} ({chat_id}) entfernt.")
 
 
 def save_registered_chats():
@@ -226,15 +196,19 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('help', help_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.ALL & filters.ChatType.PRIVATE & (~filters.COMMAND), receive_message))
+    app.add_handler(
+        MessageHandler(filters.ALL & filters.ChatType.PRIVATE & (~filters.COMMAND), receive_message)
+    )
 
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == '__main__':
-     main()
+    main()
+
+
+
 
 
